@@ -35,6 +35,8 @@ import org.apache.activemq.command.ConsumerInfo;
 import org.apache.activemq.command.DestinationInfo;
 import org.apache.activemq.command.Message;
 import org.apache.activemq.command.ProducerInfo;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Verifies if a authenticated user can do an operation against the broker using
@@ -43,6 +45,8 @@ import org.apache.activemq.command.ProducerInfo;
  *
  */
 public class AuthorizationBroker extends BrokerFilter implements SecurityAdminMBean {
+
+    private static final Logger LOG = LoggerFactory.getLogger(AuthorizationBroker.class);
 
     private volatile AuthorizationMap authorizationMap;
 
@@ -165,6 +169,7 @@ public class AuthorizationBroker extends BrokerFilter implements SecurityAdminMB
         }
 
         if (!securityContext.isBrokerContext() && allowedACLs != null && !securityContext.isInOneOf(allowedACLs) ) {
+            logDestinationTypeHint(securityContext, info.getDestination(), "read");
             throw new SecurityException("User " + securityContext.getUserName() + " is not authorized to read from: " + info.getDestination());
         }
 
@@ -205,6 +210,7 @@ public class AuthorizationBroker extends BrokerFilter implements SecurityAdminMB
                 allowedACLs = authorizationMap.getTempDestinationWriteACLs();
             }
             if (allowedACLs != null && !securityContext.isInOneOf(allowedACLs)) {
+                logDestinationTypeHint(securityContext, info.getDestination(), "write");
                 throw new SecurityException("User " + securityContext.getUserName() + " is not authorized to write to: " + info.getDestination());
             }
             securityContext.getAuthorizedWriteDests().put(info.getDestination(), info.getDestination());
@@ -227,12 +233,47 @@ public class AuthorizationBroker extends BrokerFilter implements SecurityAdminMB
             }
 
             if (allowedACLs != null && !securityContext.isInOneOf(allowedACLs)) {
+                logDestinationTypeHint(securityContext, messageSend.getDestination(), "write");
                 throw new SecurityException("User " + securityContext.getUserName() + " is not authorized to write to: " + messageSend.getDestination());
             }
             securityContext.getAuthorizedWriteDests().put(messageSend.getDestination(), messageSend.getDestination());
         }
 
         super.send(producerExchange, messageSend);
+    }
+
+    /**
+     * Logs a server-side warning hint when a user is denied access to a destination,
+     * but would have access to the same destination name under the alternate type
+     * (queue vs topic). This helps operators diagnose configuration mismatches
+     * where a destination is declared as the wrong type in the authorization map.
+     */
+    void logDestinationTypeHint(SecurityContext securityContext, ActiveMQDestination destination, String operation) {
+        if (destination.isTemporary() || destination.isComposite()) {
+            return;
+        }
+
+        final ActiveMQDestination alternate = destination.isQueue()
+            ? new ActiveMQTopic(destination.getPhysicalName())
+            : new ActiveMQQueue(destination.getPhysicalName());
+
+        final Set<?> alternateACLs = "write".equals(operation)
+            ? authorizationMap.getWriteACLs(alternate)
+            : authorizationMap.getReadACLs(alternate);
+
+        if (alternateACLs != null && securityContext.isInOneOf(alternateACLs)) {
+            final String currentType = destination.isQueue() ? "queue" : "topic";
+            final String alternateType = destination.isQueue() ? "topic" : "queue";
+            LOG.warn("Possible destination type mismatch: user '{}' is not authorized to {} {} '{}', "
+                + "but a {} authorization entry for '{}' would grant access. "
+                + "Verify the destination type in the broker configuration.",
+                securityContext.getUserName(),
+                operation,
+                currentType,
+                destination.getPhysicalName(),
+                alternateType,
+                destination.getPhysicalName());
+        }
     }
 
     // SecurityAdminMBean interface
